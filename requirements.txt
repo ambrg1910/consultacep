@@ -3,5 +3,4 @@ pandas
 openpyxl
 httpx
 cachetools
-streamlit-lottie
 requests
