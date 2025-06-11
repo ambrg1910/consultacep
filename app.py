@@ -1,4 +1,4 @@
-# app.py (Versão 13.0 - A Versão Final Polida para o Analista Sênior)
+# app.py (Versão 14.0 - A Versão Final com UI/UX de Elite)
 import streamlit as st
 import pandas as pd
 import asyncio
@@ -10,18 +10,20 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
-# --- CONFIGURAÇÃO GLOBAL (sem alterações) ---
+# --- CONFIGURAÇÃO GLOBAL ---
 CONCURRENCY_LIMIT = 40; MAX_RETRIES = 3; REQUEST_TIMEOUT = 15
 VIACEP_URL = "https://viacep.com.br/ws/{cep}/json/"
 BRASILAPI_V2_URL = "https://brasilapi.com.br/api/cep/v2/{cep}"
 AWESOMEAPI_URL = "https://cep.awesomeapi.com.br/json/{cep}"
 
-# --- FUNÇÕES DE BACKEND (sem alterações lógicas, apenas o que é essencial para UI) ---
+# --- FUNÇÕES DE BACKEND ---
+
 def find_column_by_keyword(df: pd.DataFrame, keyword: str) -> Optional[str]:
     for col in df.columns:
         if keyword.lower() in str(col).lower(): return str(col)
     return None
 
+# <<--- MELHORIA 1: FUNÇÃO DE STATUS TOTALMENTE RECONSTRUÍDA PARA USAR MÉTRICAS --->>
 @st.cache_data(ttl=60, show_spinner=False)
 def get_api_statuses():
     statuses = {}; apis = {"BrasilAPI": BRASILAPI_V2_URL, "ViaCEP": VIACEP_URL, "AwesomeAPI": AWESOMEAPI_URL}
@@ -33,20 +35,41 @@ def get_api_statuses():
     st.session_state.last_check_time = datetime.now(timezone.utc); return statuses
 
 def display_api_status_dashboard():
+    """Componente reutilizável que exibe um dashboard de status profissional com métricas."""
     st.caption("Status dos Serviços Externos")
     statuses = get_api_statuses()
     cols = st.columns(len(statuses))
     for col, (name, data) in zip(cols, statuses.items()):
         with col:
-            icon = "✅" if data['status'] == "Online" else "⚠️" if data['status'] == 'Com Erros' else '❌'
-            st.metric(label=f"{name}", value=f"{icon} {data['status']}", help=f"Tempo de Resposta: {data['latency']} ms" if data['latency'] >= 0 else "Sem Resposta")
+            # Usa métricas para exibir status e latência de forma clara
+            delta_color = "off" if data['status'] == 'Online' else "inverse"
+            st.metric(label=name, value=data['status'], delta=f"{data['latency']} ms" if data['latency'] >= 0 else "N/A", delta_color=delta_color)
+
     if 'last_check_time' in st.session_state:
         time_diff = (datetime.now(timezone.utc) - st.session_state.last_check_time).total_seconds()
         st.caption(f"*Verificado há {int(time_diff)} segundos.*")
 
+# <<--- MELHORIA 2: FUNÇÃO DE CARD REFINADA PARA MAIOR CLAREZA --->>
+def display_result_card(resultado, api_name, status):
+    """Exibe o resultado da consulta em um card limpo e profissional."""
+    with st.container(border=True):
+        st.subheader(api_name, anchor=False)
+        if status == "Sucesso":
+            # Usar text_area desabilitado cria um bloco de texto bem formatado e fácil de copiar
+            st.text_area("Resultado",
+                f"CEP:        {resultado.get('cep') or resultado.get('code', 'N/A')}\n"
+                f"Endereço:   {resultado.get('street') or resultado.get('logradouro') or resultado.get('address', 'N/A')}\n"
+                f"Bairro:     {resultado.get('neighborhood') or resultado.get('bairro') or resultado.get('district', 'N/A')}\n"
+                f"Cidade/UF:  {resultado.get('city') or resultado.get('localidade', 'N/A')} / {resultado.get('state') or resultado.get('uf', 'N/A')}",
+                height=130, disabled=True, label_visibility="collapsed")
+        else:
+            st.error(status)
+# <<-------------------------------------------------------------------------------->>
+
+# (Restante do backend sem alterações lógicas)
 @st.cache_data(ttl=3600, show_spinner="Consultando APIs...")
-def consulta_cep_completa(cep):
-    results = {}
+def consulta_cep_completa(cep): # ...
+    results = {};
     try: r = requests.get(BRASILAPI_V2_URL.format(cep=cep), timeout=5); results['BrasilAPI'] = {"data": r.json(), "status": "Sucesso"} if r.ok else {"data": None, "status": "Não encontrado"}
     except: results['BrasilAPI'] = {"data": None, "status": "Serviço indisponível"}
     try: r = requests.get(VIACEP_URL.format(cep=cep), timeout=5); results['ViaCEP'] = {"data": r.json(), "status": "Sucesso"} if r.ok and 'erro' not in r.text else {"data": None, "status": "Não encontrado"}
@@ -55,19 +78,6 @@ def consulta_cep_completa(cep):
     except: results['AwesomeAPI'] = {"data": None, "status": "Serviço indisponível"}
     return results
 
-def display_result_card(resultado, api_name, status):
-    with st.container(border=True):
-        st.subheader(api_name, anchor=False)
-        if status == "Sucesso":
-            st.text_area("Resultado",
-                f"CEP: {resultado.get('cep') or resultado.get('code', 'N/A')}\n"
-                f"Endereço: {resultado.get('street') or resultado.get('logradouro') or resultado.get('address', 'N/A')}\n"
-                f"Bairro: {resultado.get('neighborhood') or resultado.get('bairro') or resultado.get('district', 'N/A')}\n"
-                f"Cidade/UF: {resultado.get('city') or resultado.get('localidade', 'N/A')} / {resultado.get('state') or resultado.get('uf', 'N/A')}",
-                height=130, disabled=True)
-        else: st.error(status)
-
-# (Backend de Consulta em Lote sem alterações)
 async def fetch_and_format_lote(original_row, cep, session): #...
     if not cep or not cep.isdigit() or len(cep) != 8:
         error_row = original_row.copy(); error_row['STATUS'] = 'Formato de CEP Inválido'
@@ -91,7 +101,6 @@ async def fetch_and_format_lote(original_row, cep, session): #...
     else: new_row_awe['STATUS'] = 'AWESOMEAPI: Falha'
     output_rows.append(new_row_awe)
     return output_rows
-
 async def processar_dataframe_em_linhas(df, cep_col, prop_col):#...
     df['cep_padronizado'] = df[cep_col].astype(str).str.replace(r'\D', '', regex=True).str.zfill(8)
     semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
@@ -108,7 +117,6 @@ async def processar_dataframe_em_linhas(df, cep_col, prop_col):#...
     final_df = pd.DataFrame(all_new_rows); final_cols = [prop_col, cep_col, 'ENDEREÇO', 'BAIRRO', 'CIDADE', 'ESTADO', 'STATUS']
     existing_cols = [c for c in final_cols if c in final_df.columns]
     return final_df[existing_cols]
-
 def to_excel_bytes(df): #...
     output = BytesIO();
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -118,33 +126,26 @@ def to_excel_bytes(df): #...
 
 # --- INTERFACE GRÁFICA PROFISSIONAL ---
 st.set_page_config(page_title="Serviços CEP - Capital Consig", layout="wide")
-
-# <<--- MELHORIA 1: REMOÇÃO DO BOTÃO "FULLSCREEN" DA LOGO ---
-st.markdown("<style> button[title='Fullscreen'] {display: none;} </style>", unsafe_allow_html=True)
+st.markdown("<style> button[title='Fullscreen'] {display: none;} </style>", unsafe_allow_html=True) # Esconde o botão da logo
 
 with st.sidebar:
     st.image("logo.png", use_container_width=True)
     st.title("Capital Consig")
-    st.info("Ferramenta para Validação e Enriquecimento de Dados de CEP.")
+    st.info("Portal de Validação e Enriquecimento de Dados.")
 
 st.header("Portal de Serviços de CEP")
 st.divider()
 
-# <<--- MELHORIA 2: REMOÇÃO DOS EMOJIS DAS ABAS ---
-tab_individual, tab_lote = st.tabs(["Consulta Individual", "Consulta em Lote (Multi-API)"])
+tab_individual, tab_lote = st.tabs(["Consulta Individual", "Consulta em Lote"])
 
 with tab_individual:
     display_api_status_dashboard()
     st.divider()
     st.subheader("Consulta Unitária por CEP")
-    
-    col1_form, col2_form = st.columns([3, 1])
-    with col1_form:
-        cep_input = st.text_input("Digite o CEP (apenas números):", max_chars=8, label_visibility="collapsed")
-    with col2_form:
-        # <<--- MELHORIA 3: BOTÃO DE CONSULTA COM TAMANHO CORRETO ---
-        consultar = st.button("Consultar CEP", use_container_width=True)
-    
+    col1, col2 = st.columns([3, 1])
+    cep_input = col1.text_input("Digite o CEP (apenas números):", max_chars=8, label_visibility="collapsed")
+    consultar = col2.button("Consultar CEP")
+
     if consultar:
         if cep_input and len(cep_input) == 8 and cep_input.isdigit():
             resultados = consulta_cep_completa(cep_input)
@@ -153,30 +154,26 @@ with tab_individual:
             for col, (api_name, result_data) in zip(cols, resultados.items()):
                 with col:
                     display_result_card(result_data['data'], api_name, result_data['status'])
-        else:
-            st.warning("Por favor, digite um CEP válido com 8 dígitos para realizar a consulta.")
+        else: st.warning("Digite um CEP válido com 8 dígitos para consultar.")
 
 with tab_lote:
     display_api_status_dashboard()
     st.divider()
     st.subheader("Processamento de Planilha em Lote")
-    st.info("Esta funcionalidade consulta 3 fontes de dados para cada CEP e retorna o resultado em múltiplas linhas para auditoria.", icon="💡")
-    
+    st.info("Esta funcionalidade consulta 3 APIs para cada CEP e retorna o resultado em múltiplas linhas para auditoria.", icon="ℹ️")
     uploaded_file = st.file_uploader("Selecione sua planilha (.xlsx ou .csv)", label_visibility="collapsed")
     if uploaded_file:
         try:
             df = pd.read_excel(uploaded_file, engine='openpyxl', dtype=str)
-            cep_col = find_column_by_keyword(df, "cep")
-            prop_col = find_column_by_keyword(df, "proposta")
+            cep_col, prop_col = find_column_by_keyword(df, "cep"), find_column_by_keyword(df, "proposta")
             if not cep_col or not prop_col:
-                if not cep_col: st.error("ERRO: Coluna de 'CEP' não encontrada na planilha.")
-                if not prop_col: st.error("ERRO: Coluna de 'PROPOSTA' não encontrada na planilha.")
+                if not cep_col: st.error("Coluna 'CEP' não encontrada.")
+                if not prop_col: st.error("Coluna 'PROPOSTA' não encontrada.")
             else:
-                st.success(f"Arquivo '{uploaded_file.name}' carregado. Colunas encontradas: '{prop_col}' e '{cep_col}'.")
+                st.success(f"Arquivo '{uploaded_file.name}' carregado. Colunas identificadas: '{prop_col}' e '{cep_col}'.")
                 if st.button("Processar Planilha Completa", use_container_width=True):
                     df_final = asyncio.run(processar_dataframe_em_linhas(df, cep_col, prop_col))
                     st.subheader("Processamento Concluído")
                     st.dataframe(df_final, use_container_width=True)
                     st.download_button("Baixar Resultados (.xlsx)", to_excel_bytes(df_final), f"{uploaded_file.name.split('.')[0]}_RESULTADO_FINAL.xlsx", use_container_width=True)
-        except Exception as e:
-            st.error(f"Erro ao processar: {e}")
+        except Exception as e: st.error(f"Erro Crítico: {e}")
