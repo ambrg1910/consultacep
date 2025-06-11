@@ -1,10 +1,12 @@
-# app.py (versão com comunicação profissional e corporativa)
+# app.py (versão final com identidade visual "Capital Consig")
 import streamlit as st
 import pandas as pd
 import asyncio
 import httpx
 from io import BytesIO
 from cachetools import TTLCache
+import requests
+from streamlit_lottie import st_lottie
 
 # --- CONFIGURAÇÃO DA APLICAÇÃO (sem alterações) ---
 CONCURRENCY_LIMIT = 50
@@ -16,6 +18,7 @@ BRASILAPI_URL = "https://brasilapi.com.br/api/cep/v2/{cep}"
 cep_cache = TTLCache(maxsize=10_000, ttl=86400)
 # ----------------------------------------------------
 
+# (O código de backend 'fetch_cep_data', 'processar_dataframe', etc. permanece o mesmo)
 async def fetch_cep_data(cep: str) -> dict: # (sem alterações)
     if cep in cep_cache: return cep_cache[cep]
     if not cep or not cep.isdigit() or len(cep) != 8: return {"status_consulta": "CEP Inválido"}
@@ -40,12 +43,10 @@ async def processar_dataframe(df: pd.DataFrame, cep_column_name: str) -> pd.Data
     async def run_fetch(cep):
         async with semaphore: return await fetch_cep_data(cep)
     tasks = [run_fetch(cep) for cep in df['cep_padronizado'].tolist()]
-    progress_bar = st.progress(0, text="Processando... Por favor, aguarde.")
     results = []
-    for i, f in enumerate(asyncio.as_completed(tasks)):
+    for f in asyncio.as_completed(tasks):
         results.append(await f)
-        progress_bar.progress((i + 1) / len(tasks), text=f"Processando... {i+1} de {len(tasks)}")
-    progress_bar.empty()
+    # Reordenar para manter a consistência com o dataframe de entrada
     cep_to_result_map = dict(zip(df['cep_padronizado'], results))
     ordered_results = [cep_to_result_map[cep] for cep in df['cep_padronizado']]
     return pd.concat([df.drop(columns=['cep_padronizado']), pd.DataFrame(ordered_results)], axis=1)
@@ -56,15 +57,30 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes: # (sem alterações)
         df.to_excel(writer, index=False, sheet_name='Resultados')
     return output.getvalue()
 
+def load_lottieurl(url: str):
+    r = requests.get(url)
+    if r.status_code != 200:
+        return None
+    return r.json()
+
 # --- INTERFACE GRÁFICA PROFISSIONAL ---
-st.set_page_config(page_title="Consulta de CEPs em Lote", layout="wide") # 'wide' para layout mais espaçoso
+st.set_page_config(page_title="Consulta CEP - Capital Consig", layout="wide")
+
+# Barra Lateral com a Logo e Informações
+with st.sidebar:
+    st.image("logo.png", use_column_width=True)
+    st.title("Capital Consig")
+    st.info("Esta é a ferramenta oficial para validação e enriquecimento de CEPs em lote.")
+
+# Corpo Principal da Aplicação
 st.title("Sistema de Consulta de CEPs em Lote")
-st.markdown("Carregue sua planilha (Excel ou CSV) para validar e enriquecer os dados de CEP.")
+st.markdown("Carregue sua planilha (Excel ou CSV) para iniciar o processo.")
 st.markdown("---")
 
 uploaded_file = st.file_uploader(
     "Selecione o Arquivo de CEPs",
-    type=["xlsx", "csv"]
+    type=["xlsx", "csv"],
+    label_visibility="collapsed"
 )
 
 if uploaded_file is not None:
@@ -73,13 +89,18 @@ if uploaded_file is not None:
         cep_col_name = next((col for col in df.columns if 'cep' in str(col).lower()), None)
         
         if cep_col_name is None:
-            st.error("ERRO: Nenhuma coluna contendo 'CEP' foi encontrada na planilha. Verifique o cabeçalho do arquivo e tente novamente.")
+            st.error("ERRO: Nenhuma coluna contendo 'CEP' foi encontrada na planilha. Verifique o cabeçalho do arquivo.")
         else:
             st.success(f"Arquivo '{uploaded_file.name}' carregado. Coluna de CEP identificada: '{cep_col_name}'.")
-            st.info(f"Total de registros encontrados na planilha: {len(df)}.")
             
-            if st.button("Validar e Processar CEPs"):
-                with st.spinner('Executando consultas...'): # Usando um spinner para uma animação mais sóbria
+            if st.button(f"Processar {len(df)} Registros"):
+                lottie_loading = load_lottieurl("https://assets5.lottiefiles.com/packages/lf20_stcrz6c5.json") # Uma animação de carregamento azul
+                
+                # Exibe a animação profissional enquanto o backend trabalha
+                with st.spinner("Executando consultas... As animações abaixo indicam o progresso."):
+                    if lottie_loading:
+                        st_lottie(lottie_loading, speed=1, height=150, key="loading")
+                    
                     df_final = asyncio.run(processar_dataframe(df, cep_col_name))
 
                 st.header("Resultados do Processamento")
@@ -89,20 +110,19 @@ if uploaded_file is not None:
                 erros = total - sucessos - nao_encontrados
                 
                 col1, col2, col3 = st.columns(3)
-                col1.metric("Total de Registros", total, help="Número total de linhas na planilha enviada.")
-                col2.metric("Consultas com Sucesso", sucessos, help="CEPs válidos e encontrados.")
-                col3.metric("Falhas de Consulta", erros, help="CEPs que não puderam ser processados após múltiplas tentativas.")
+                col1.metric("Total de Registros", total)
+                col2.metric("Consultas com Sucesso", sucessos)
+                col3.metric("Falhas de Consulta", erros)
 
                 st.dataframe(df_final)
 
                 excel_data = to_excel_bytes(df_final)
-
                 st.download_button(
-                    label="Baixar Planilha Processada",
+                    label="Baixar Planilha Processada (.xlsx)",
                     data=excel_data,
-                    file_name=f"{uploaded_file.name.split('.')[0]}_PROCESSADO.xlsx", # Nome do arquivo de saída alterado
+                    file_name=f"{uploaded_file.name.split('.')[0]}_PROCESSADO.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
 
     except Exception as e:
-        st.error(f"Ocorreu um erro inesperado ao processar o arquivo. Detalhe: {e}")
+        st.error(f"Ocorreu um erro inesperado: {e}")
