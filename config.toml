@@ -1,7 +1,16 @@
-# .streamlit/config.toml
+# .streamlit/config.toml (Tema Profissional Dark)
 [theme]
-primaryColor="#1E3A8A"  # Um Azul Royal corporativo e escuro
-backgroundColor="#F0F2F6"
-secondaryBackgroundColor="#FFFFFF"
-textColor="#000000"
+# Cor primária de destaque (botões, etc.) - Nosso Azul Royal
+primaryColor="#3B82F6"
+
+# Fundo principal da aplicação
+backgroundColor="#0F172A" # Um azul-escuro/quase preto corporativo
+
+# Fundo para elementos como a barra lateral e caixas
+secondaryBackgroundColor="#1E293B"
+
+# Cor principal do texto
+textColor="#FFFFFF"
+
+# Fonte padrão do Streamlit
 font="sans serif"
