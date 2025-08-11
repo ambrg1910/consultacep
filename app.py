@@ -1,177 +1,284 @@
-# app.py (Versão 12.1 - Final Stability Release)
 import streamlit as st
 import pandas as pd
 import requests
-from io import BytesIO
-from typing import Optional, List, Dict, Any
-from pathlib import Path
-from datetime import datetime, timedelta
-import database as db
 import time
+import io
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import timedelta
 
-# --- CONFIGURAÇÕES ---
-BATCH_SIZE = 200
-MAX_WORKERS = 20
-REQUEST_TIMEOUT = 10
-DATA_DIR = Path("data")
-VIACEP_URL = "https://viacep.com.br/ws/{cep}/json/"
-BRASILAPI_V2_URL = "https://brasilapi.com.br/api/cep/v2/{cep}"
+# --- Constantes e Configuração Inicial ---
+BRASIL_API_URL = "https://brasilapi.com.br/api/cep/v2/{}"
+VIACEP_API_URL = "https://viacep.com.br/ws/{}/json/"
+MAX_WORKERS = 20  # Limite sensato para não sobrecarregar as APIs
+REQUEST_TIMEOUT = 10  # Segundos para timeout das requisições
+MAX_RETRIES = 2 # Tentativas para cada API antes de falhar
 
-# --- FUNÇÕES CORE ---
-def find_column_by_keyword(df: pd.DataFrame, keyword: str) -> Optional[str]:
-    for col in df.columns:
-        if keyword.lower() in str(col).lower(): return str(col)
-    return None
+# --- Configuração da Página Streamlit ---
+st.set_page_config(
+    page_title="O Motor de Validação v12",
+    page_icon="⚡",
+    layout="wide"
+)
 
-def get_cep_data(cep: str, session: requests.Session) -> Dict[str, Any]:
-    try: # Tenta BrasilAPI
-        resp = session.get(BRASILAPI_V2_URL.format(cep=cep), timeout=REQUEST_TIMEOUT)
-        if resp.ok:
-            data = resp.json()
-            return {'ENDEREÇO': data.get('street'), 'BAIRRO': data.get('neighborhood'), 'CIDADE': data.get('city'), 'ESTADO': data.get('state'), 'STATUS': 'BRASILAPI: Sucesso'}
-    except requests.exceptions.RequestException: pass
+# --- Funções de Lógica de Negócio ---
 
-    try: # Tenta ViaCEP se o primeiro falhar
-        resp = session.get(VIACEP_URL.format(cep=cep), timeout=REQUEST_TIMEOUT)
-        if resp.ok and 'erro' not in resp.text:
-            data = resp.json()
-            return {'ENDEREÇO': data.get('logradouro'), 'BAIRRO': data.get('bairro'), 'CIDADE': data.get('localidade'), 'ESTADO': data.get('uf'), 'STATUS': 'VIACEP: Sucesso'}
-    except requests.exceptions.RequestException: pass
+def find_columns(df_columns):
+    """Identifica inteligentemente as colunas de PROPOSTA e CEP."""
+    proposta_col = None
+    cep_col = None
+    for col in df_columns:
+        if re.search("proposta", col, re.IGNORECASE):
+            proposta_col = col
+        if re.search("cep", col, re.IGNORECASE):
+            cep_col = col
+    return proposta_col, cep_col
+
+def get_cep_data(cep, session):
+    """
+    Busca dados de um CEP com estratégia Primary/Fallback e retentativas.
+    Essa função é o coração da resiliência.
+    """
+    clean_cep = re.sub(r'\D', '', str(cep))
+    if len(clean_cep) != 8:
+        return {'status': 'CEP Inválido'}
+
+    # 1. Tentar BrasilAPI (Primary) com retentativas
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = session.get(BRASIL_API_URL.format(clean_cep), timeout=REQUEST_TIMEOUT)
+            if response.status_code == 200:
+                data = response.json()
+                return {
+                    'endereco': data.get('street'),
+                    'bairro': data.get('neighborhood'),
+                    'cidade': data.get('city'),
+                    'estado': data.get('state'),
+                    'status': 'OK - BrasilAPI'
+                }
+        except requests.exceptions.RequestException:
+            time.sleep(0.5) # Pausa antes de retentativa
+            continue
     
-    return {'STATUS': 'FALHA TOTAL'}
+    # 2. Tentar ViaCEP (Fallback) com retentativas
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = session.get(VIACEP_API_URL.format(clean_cep), timeout=REQUEST_TIMEOUT)
+            if response.status_code == 200:
+                data = response.json()
+                if not data.get('erro'):
+                    return {
+                        'endereco': data.get('logradouro'),
+                        'bairro': data.get('bairro'),
+                        'cidade': data.get('localidade'),
+                        'estado': data.get('uf'),
+                        'status': 'OK - ViaCEP'
+                    }
+        except requests.exceptions.RequestException:
+            time.sleep(0.5) # Pausa antes de retentativa
+            continue
+    
+    return {'status': 'Falha na Consulta'}
 
-def process_batch(lote_df: pd.DataFrame, job_info: Dict) -> List[Dict]:
-    cep_unicos_map = {row['cep_padronizado']: {'PROPOSTA': row[job_info['prop_col']], 'CEP': row[job_info['cep_col']]} for _, row in lote_df.drop_duplicates(subset=['cep_padronizado']).iterrows()}
-    result_map = {}
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        with requests.Session() as session:
-            future_to_cep = {executor.submit(get_cep_data, cep, session): cep for cep in cep_unicos_map.keys()}
-            for future in as_completed(future_to_cep):
-                cep = future_to_cep[future]
+def process_job(job_df, cep_col, ui_placeholders):
+    """
+    Processa um único job (DataFrame) usando ThreadPoolExecutor.
+    Atualiza os placeholders da UI em tempo real.
+    """
+    total_records = len(job_df)
+    results = [None] * total_records
+    records_processed = 0
+    start_time = time.time()
+
+    with requests.Session() as session:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_index = {
+                executor.submit(get_cep_data, row[cep_col], session): index
+                for index, row in job_df.iterrows()
+            }
+
+            for future in as_completed(future_to_index):
+                index = future_to_index[future]
                 try:
-                    result = future.result()
-                    result_map[cep] = {**cep_unicos_map[cep], **result}
-                except Exception:
-                    result_map[cep] = {**cep_unicos_map[cep], 'STATUS': 'ERRO CRÍTICO'}
-    
-    final_batch_results = []
-    for _, row in lote_df.iterrows():
-        processed_result = result_map.get(row['cep_padronizado'])
-        if processed_result:
-            final_batch_results.append(processed_result)
-        else: # CEPs duplicados no mesmo lote
-            original_cep_result = result_map.get(row['cep_padronizado'])
-            if original_cep_result:
-                 # Copia o resultado do CEP original mas com os dados da proposta atual
-                new_result = original_cep_result.copy()
-                new_result['PROPOSTA'] = row[job_info['prop_col']]
-                new_result['CEP'] = row[job_info['cep_col']]
-                final_batch_results.append(new_result)
-            else: # Se o CEP for inválido, por exemplo
-                 final_batch_results.append({'PROPOSTA': row[job_info['prop_col']], 'CEP': row[job_info['cep_col']], 'STATUS': 'CEP Inválido'})
+                    results[index] = future.result()
+                except Exception as e:
+                    results[index] = {'status': f'Erro: {e}'}
+                
+                records_processed += 1
+                
+                # --- Atualização do Painel de Controle (Feedback em Tempo Real) ---
+                if records_processed % 10 == 0 or records_processed == total_records: # Atualiza a cada 10 registros
+                    elapsed_time = time.time() - start_time
+                    speed = records_processed / elapsed_time if elapsed_time > 0 else 0
+                    etc_seconds = (total_records - records_processed) / speed if speed > 0 else 0
+                    
+                    progress = records_processed / total_records
+                    
+                    with ui_placeholders["progress_bar"]:
+                        st.progress(progress, text=f"Processando... {records_processed}/{total_records}")
+                    
+                    with ui_placeholders["metrics"]:
+                        etc_str = str(timedelta(seconds=int(etc_seconds)))
+                        st.metric(label="Velocidade Atual", value=f"{speed:.1f} reg/s")
 
-    return final_batch_results
+                    with ui_placeholders["etc"]:
+                        st.metric(label="Tempo Estimado de Conclusão", value=f"{etc_str}")
 
-def run_worker_job(job_id: int):
-    job_info = db.get_job_by_id(job_id)
-    
-    ui_elements = st.session_state.ui_elements
-    ui_elements["main_panel"].info(f"TRABALHADOR ATIVO - Processando Job #{job_info['id']}: {job_info['original_filename']}")
-    ui_elements["main_panel"].warning("A aplicação está processando. Não feche ou recarregue esta aba.")
-    
+    return pd.DataFrame(results)
+
+def to_excel(df):
+    """Converte um DataFrame para um objeto BytesIO em formato Excel."""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Resultados')
+    return output.getvalue()
+
+# --- Gerenciamento de Estado da Aplicação (O segredo para a UI não congelar) ---
+if 'jobs_queue' not in st.session_state:
+    st.session_state.jobs_queue = []
+if 'completed_jobs' not in st.session_state:
+    st.session_state.completed_jobs = []
+if 'is_processing' not in st.session_state:
+    st.session_state.is_processing = False
+if 'job_counter' not in st.session_state:
+    st.session_state.job_counter = 0
+
+# --- Interface do Usuário (UI) ---
+
+st.title("🚀 O Motor de Validação da Capital Consig v12")
+st.markdown("A ferramenta definitiva para validação de CEPs em massa. *Confiabilidade e performance para o operador.*")
+
+# --- Seção de Upload de Jobs ---
+st.header("1. Adicionar Novo Job à Fila")
+
+uploaded_file = st.file_uploader(
+    "Arraste e solte um arquivo Excel (.xlsx) aqui",
+    type="xlsx",
+    disabled=st.session_state.is_processing
+)
+
+if uploaded_file is not None:
     try:
-        df_full = pd.read_excel(job_info['saved_filepath'], dtype=str)
-        df_full['cep_padronizado'] = df_full[job_info['cep_col']].astype(str).str.replace(r'\D', '', regex=True).str.zfill(8)
+        df = pd.read_excel(uploaded_file)
+        proposta_col, cep_col = find_columns(df.columns)
         
-        start_time = time.time()
-        lotes = [df_full.iloc[i:i + BATCH_SIZE] for i in range(0, len(df_full), BATCH_SIZE)]
-        processed_count = 0
-
-        for i, lote_df in enumerate(lotes):
-            results = process_batch(lote_df, job_info)
-            db.save_results_to_db(job_id, results)
-            processed_count += len(lote_df)
-            db.update_job_status(job_id, 'PROCESSANDO', processed_count)
-
-            elapsed = time.time() - start_time
-            speed = processed_count / elapsed if elapsed > 0 else 0
-            remaining = job_info['total_ceps'] - processed_count
-            etc = timedelta(seconds=int(remaining / speed)) if speed > 0 else "..."
+        if not proposta_col or not cep_col:
+            st.error(f"Erro: Não foi possível encontrar as colunas 'PROPOSTA' e 'CEP' no arquivo. Colunas encontradas: {', '.join(df.columns)}")
+        else:
+            st.session_state.job_counter += 1
+            job_id = f"Job #{st.session_state.job_counter} - {uploaded_file.name}"
             
-            ui_elements["progress_bar"].progress(processed_count / job_info['total_ceps'], text=f"Lote {i+1}/{len(lotes)} | {processed_count} de {job_info['total_ceps']}")
-            ui_elements["speed_metric"].metric("Velocidade", f"{speed:.1f} reg/s")
-            ui_elements["etc_metric"].metric("Tempo Restante", str(etc))
-        
-        db.update_job_status(job_id, 'CONCLUIDO')
-        ui_elements["main_panel"].success(f"Job #{job_id} concluído com sucesso!")
+            # Adiciona na fila global, mas evita duplicatas se a página recarregar
+            if not any(j['id'] == job_id for j in st.session_state.jobs_queue):
+                st.session_state.jobs_queue.append({
+                    "id": job_id,
+                    "df": df,
+                    "proposta_col": proposta_col,
+                    "cep_col": cep_col,
+                    "status": "Pendente",
+                    "original_df": df.copy() # Guarda o original
+                })
+                st.success(f"✅ Job '{job_id}' ({len(df)} registros) adicionado à fila.")
 
     except Exception as e:
-        db.update_job_status(job_id, 'FALHOU')
-        ui_elements["main_panel"].error(f"Erro crítico no Job #{job_id}: {e}")
-    finally:
-        st.session_state.active_job_id = None
-        time.sleep(3); st.rerun()
+        st.error(f"Ocorreu um erro ao ler o arquivo: {e}")
 
-def main():
-    st.set_page_config(page_title="Capital Consig - Validador CEP", layout="wide")
-    db.init_db()
+st.divider()
 
-    if 'active_job_id' not in st.session_state:
-        st.session_state.active_job_id = None
+# --- Seção da Fila e Processamento ---
+st.header("2. Fila de Processamento e Controle")
+
+# Painel de Controle do Job ATIVO (aparecerá quando o processamento iniciar)
+if st.session_state.is_processing:
+    st.subheader("Painel de Controle do Job Ativo")
+    st.info(f"Processando: **{st.session_state.jobs_queue[0]['id']}**")
     
-    active_job = db.get_active_job()
-    st.session_state.active_job_id = active_job['id'] if active_job else None
+    # Placeholders para as atualizações em tempo real
+    progress_bar_placeholder = st.empty()
+    cols = st.columns(2)
+    metrics_placeholder = cols[0]
+    etc_placeholder = cols[1]
+else:
+    # Cria placeholders vazios para evitar erro quando o botão for clicado
+    progress_bar_placeholder = st.empty()
+    metrics_placeholder = st.empty()
+    etc_placeholder = st.empty()
 
-    with st.sidebar:
-        st.image("logo.png", use_container_width=True); st.title("Portal de Validação")
-        st.info("Unbreakable Engine v12.1")
-    st.header("Processamento de CEP em Lote")
-    
-    if st.session_state.active_job_id:
-        st.session_state.ui_elements = {
-            "progress_bar": st.progress(0),
-            "speed_metric": st.columns(3)[0].empty(),
-            "etc_metric": st.columns(3)[1].empty(),
-            "main_panel": st.container()
-        }
-        run_worker_job(st.session_state.active_job_id)
-    else:
-        with st.expander("1. Adicionar Novo Job à Fila", expanded=True):
-            uploaded_file = st.file_uploader("Selecione sua planilha (.xlsx)")
-            if uploaded_file:
-                try:
-                    df = pd.read_excel(uploaded_file, dtype=str)
-                    cep_col = find_column_by_keyword(df, "cep")
-                    prop_col = find_column_by_keyword(df, "proposta")
-                    if cep_col and prop_col:
-                        st.success(f"Arquivo OK! {len(df)} registros.")
-                        if st.button("➕ Adicionar à Fila", use_container_width=True):
-                            filepath = DATA_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uploaded_file.name}"
-                            with open(filepath, "wb") as f: f.write(uploaded_file.getbuffer())
-                            db.create_job(uploaded_file.name, str(filepath), cep_col, prop_col, len(df))
-                            st.rerun()
-                    else: st.error("ERRO: Colunas 'CEP' e/ou 'Proposta' não encontradas.")
-                except Exception as e: st.error(f"Erro ao ler planilha: {e}")
+# Botão de Iniciar Processamento
+if st.session_state.jobs_queue and not st.session_state.is_processing:
+    if st.button("▶️ INICIAR PROCESSAMENTO DA FILA", type="primary", use_container_width=True):
+        st.session_state.is_processing = True
+        
+        # A MÁGICA ACONTECE AQUI:
+        # A função é chamada uma vez. Ela vai iterar por toda a fila.
+        # Os placeholders da UI são passados para a função para serem atualizados por ela.
+        # A UI do Streamlit não fica bloqueada esperando o fim.
+        
+        queue_copy = list(st.session_state.jobs_queue)
+        for job in queue_copy:
+            job_start_time = time.time()
+            job['status'] = 'Processando'
+            
+            # Passa os placeholders para a função de processamento
+            result_df = process_job(
+                job_df=job['original_df'], 
+                cep_col=job['cep_col'],
+                ui_placeholders={
+                    "progress_bar": progress_bar_placeholder,
+                    "metrics": metrics_placeholder,
+                    "etc": etc_placeholder
+                }
+            )
 
-        st.subheader("2. Fila de Processamento Global")
-        next_job = db.get_next_pending_job()
-        if next_job:
-            if st.button(f"▶️ INICIAR PROCESSAMENTO (Próximo: Job #{next_job['id']})", use_container_width=True, type="primary"):
-                db.update_job_status(next_job['id'], 'PROCESSANDO')
-                st.rerun()
+            # Enriquecer o DataFrame original
+            final_df = job['original_df'].copy()
+            final_df[['ENDEREÇO', 'BAIRRO', 'CIDADE', 'ESTADO', 'STATUS']] = result_df
 
-        for job in db.get_all_jobs():
-            status_color = {'PENDENTE': 'blue', 'PROCESSANDO': 'orange', 'CONCLUIDO': 'green', 'FALHOU': 'red'}.get(job['status'], 'gray')
-            with st.container(border=True):
-                c1, c2, c3 = st.columns([3, 1.5, 1])
-                c1.write(f"**Job #{job['id']}**: {job['original_filename']} ({job['processed_ceps']}/{job['total_ceps']})")
-                c2.write(f"Status: **:{status_color}[{job['status']}]**")
-                if job['status'] == 'CONCLUIDO':
-                    c3.download_button("⬇️ Exportar", to_excel_bytes(db.get_job_results_as_df(job['id'])), f"RESULTADO_JOB_{job['id']}.xlsx", use_container_width=True, key=f"dl_{job['id']}")
-                elif job['status'] == 'FALHOU':
-                     c3.error("FALHOU")
+            # Limpa os placeholders para o próximo job
+            progress_bar_placeholder.empty()
+            metrics_placeholder.empty()
+            etc_placeholder.empty()
+            
+            job_processing_time = time.time() - job_start_time
+            
+            # Move o job da fila para a lista de concluídos
+            job_concluido = {
+                'id': job['id'],
+                'df_result': final_df,
+                'record_count': len(final_df),
+                'processing_time': job_processing_time
+            }
+            st.session_state.completed_jobs.insert(0, job_concluido) # Insere no início
+            st.session_state.jobs_queue.pop(0)
+            
+        st.session_state.is_processing = False
+        st.success("🎉 Todos os jobs na fila foram processados!")
+        st.rerun() # Força um recarregamento final para limpar a UI
 
-if __name__ == "__main__":
-    main()
+# Visualização da Fila
+if st.session_state.jobs_queue:
+    st.subheader("Jobs na Fila:")
+    for job in st.session_state.jobs_queue:
+        st.text(f"➡️ {job['id']} - Status: {job['status']}")
+else:
+    st.info("A fila de processamento está vazia.")
+
+st.divider()
+
+# --- Seção de Resultados ---
+st.header("3. Jobs Concluídos")
+
+if st.session_state.completed_jobs:
+    for job in st.session_state.completed_jobs:
+        with st.expander(f"**{job['id']}** - {job['record_count']} registros processados em {job['processing_time']:.2f} segundos"):
+            st.dataframe(job['df_result'].head())
+            st.download_button(
+                label=f"⬇️ Exportar {job['id']}",
+                data=to_excel(job['df_result']),
+                file_name=f"resultado_{re.sub('[^a-zA-Z0-9]', '_', job['id'])}.xlsx",
+                mime="application/vnd.ms-excel",
+                key=f"download_{job['id']}" # Chave única para cada botão
+            )
+else:
+    st.info("Nenhum job foi concluído ainda.")

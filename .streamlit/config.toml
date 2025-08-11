@@ -1,6 +1,9 @@
+[server]
+headless = true
+port = 8501
+enableCORS = false
+
 [runner]
-pythonVersion = "3.11"
-streamlit==1.32.2
-pandas==2.2.1
-openpyxl==3.1.2
-requests==2.31.0
+# Streamlit lê o Python do ambiente, mas esta é uma boa prática
+# para documentar a versão alvo do ambiente de desenvolvimento.
+python = "3.11"
