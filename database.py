@@ -1,0 +1,125 @@
+# database.py
+import sqlite3
+import pandas as pd
+
+DB_NAME = 'jobs.db'
+
+def get_db_connection():
+    """Cria e retorna uma conexão com o banco de dados."""
+    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+    conn.row_factory = sqlite3.Row  # Permite acessar colunas por nome
+    return conn
+
+def init_db():
+    """Inicializa o banco de dados e cria as tabelas se não existirem."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Tabela para gerenciar os jobs de processamento
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            original_filename TEXT NOT NULL,
+            saved_filepath TEXT NOT NULL,
+            cep_col TEXT NOT NULL,
+            prop_col TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'PENDENTE', -- PENDENTE, PROCESSANDO, CONCLUIDO, FALHOU
+            total_ceps INTEGER DEFAULT 0,
+            processed_ceps INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            finished_at TIMESTAMP
+        )
+    ''')
+    
+    # Tabela para armazenar os resultados linha por linha
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER NOT NULL,
+            proposta TEXT,
+            cep_original TEXT,
+            endereco TEXT,
+            bairro TEXT,
+            cidade TEXT,
+            estado TEXT,
+            status_api TEXT,
+            FOREIGN KEY(job_id) REFERENCES jobs(id)
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def create_job(original_filename, saved_filepath, cep_col, prop_col, total_ceps):
+    """Cria um novo job no banco de dados."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        'INSERT INTO jobs (original_filename, saved_filepath, cep_col, prop_col, total_ceps) VALUES (?, ?, ?, ?, ?)',
+        (original_filename, saved_filepath, cep_col, prop_col, total_ceps)
+    )
+    job_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return job_id
+
+def get_all_jobs():
+    """Retorna todos os jobs do banco de dados, do mais recente para o mais antigo."""
+    conn = get_db_connection()
+    jobs = conn.execute('SELECT * FROM jobs ORDER BY created_at DESC').fetchall()
+    conn.close()
+    return jobs
+
+def get_job_by_id(job_id):
+    """Busca um job específico pelo seu ID."""
+    conn = get_db_connection()
+    job = conn.execute('SELECT * FROM jobs WHERE id = ?', (job_id,)).fetchone()
+    conn.close()
+    return job
+
+def update_job_status(job_id, status, processed_ceps=None):
+    """Atualiza o status e/ou o progresso de um job."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    if processed_ceps is not None:
+        cursor.execute('UPDATE jobs SET status = ?, processed_ceps = ? WHERE id = ?', (status, processed_ceps, job_id))
+    else:
+        cursor.execute('UPDATE jobs SET status = ? WHERE id = ?', (status, job_id))
+    
+    if status in ['CONCLUIDO', 'FALHOU']:
+        cursor.execute('UPDATE jobs SET finished_at = CURRENT_TIMESTAMP WHERE id = ?', (job_id,))
+    
+    conn.commit()
+    conn.close()
+
+def save_results_to_db(job_id, results_list):
+    """Salva uma lista de resultados no banco de dados de forma eficiente."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Prepara os dados para inserção em massa
+    rows_to_insert = []
+    for result_row in results_list:
+        rows_to_insert.append((
+            job_id,
+            result_row.get('PROPOSTA'),
+            result_row.get('CEP'),
+            result_row.get('ENDEREÇO'),
+            result_row.get('BAIRRO'),
+            result_row.get('CIDADE'),
+            result_row.get('ESTADO'),
+            result_row.get('STATUS')
+        ))
+
+    cursor.executemany(
+        'INSERT INTO results (job_id, proposta, cep_original, endereco, bairro, cidade, estado, status_api) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        rows_to_insert
+    )
+    conn.commit()
+    conn.close()
+
+def get_job_results_as_df(job_id):
+    """Busca todos os resultados de um job e retorna como um DataFrame do Pandas."""
+    conn = get_db_connection()
+    df = pd.read_sql_query(f"SELECT proposta AS PROPOSTA, cep_original as CEP, endereco as ENDEREÇO, bairro as BAIRRO, cidade as CIDADE, estado as ESTADO, status_api as STATUS FROM results WHERE job_id = {job_id}", conn)
+    conn.close()
+    return df
