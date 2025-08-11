@@ -2,7 +2,7 @@
 import sqlite3
 import pandas as pd
 
-DB_NAME = 'jobs.db'
+DB_NAME = 'data/jobs.db'
 
 def get_db_connection():
     """Cria e retorna uma conexão com o banco de dados."""
