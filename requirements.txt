@@ -1,6 +1,6 @@
 streamlit
-pandas
-openpyxl
 httpx
 cachetools
 requests
+pandas
+openpyxl
