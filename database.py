@@ -1,21 +1,27 @@
-# database.py
+# database.py (Versão final e robusta)
 import sqlite3
 import pandas as pd
+from pathlib import Path
 
-DB_NAME = 'data/jobs.db'
+# Mantemos a definição do caminho aqui
+DB_PATH = Path("data/jobs.db")
 
 def get_db_connection():
     """Cria e retorna uma conexão com o banco de dados."""
-    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-    conn.row_factory = sqlite3.Row  # Permite acessar colunas por nome
+    # Esta função agora assume que a pasta já existe.
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
     """Inicializa o banco de dados e cria as tabelas se não existirem."""
+    # <<< ESTA É A CORREÇÃO CRUCIAL >>>
+    # Garante que o diretório pai ('data') do nosso arquivo de banco de dados exista.
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    
+    # O resto da função continua normalmente, agora com a certeza de que a pasta existe.
     conn = get_db_connection()
     cursor = conn.cursor()
-    
-    # Tabela para gerenciar os jobs de processamento
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -23,15 +29,13 @@ def init_db():
             saved_filepath TEXT NOT NULL,
             cep_col TEXT NOT NULL,
             prop_col TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'PENDENTE', -- PENDENTE, PROCESSANDO, CONCLUIDO, FALHOU
+            status TEXT NOT NULL DEFAULT 'PENDENTE',
             total_ceps INTEGER DEFAULT 0,
             processed_ceps INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             finished_at TIMESTAMP
         )
     ''')
-    
-    # Tabela para armazenar os resultados linha por linha
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS results (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,6 +53,11 @@ def init_db():
     conn.commit()
     conn.close()
 
+# Nenhuma outra função abaixo precisa ser alterada.
+# Você pode copiar e colar esta função init_db() para dentro do seu
+# arquivo existente, ou substituir o arquivo inteiro por este conteúdo
+# para ter certeza.
+
 def create_job(original_filename, saved_filepath, cep_col, prop_col, total_ceps):
     """Cria um novo job no banco de dados."""
     conn = get_db_connection()
@@ -63,7 +72,7 @@ def create_job(original_filename, saved_filepath, cep_col, prop_col, total_ceps)
     return job_id
 
 def get_all_jobs():
-    """Retorna todos os jobs do banco de dados, do mais recente para o mais antigo."""
+    """Retorna todos os jobs do banco de dados."""
     conn = get_db_connection()
     jobs = conn.execute('SELECT * FROM jobs ORDER BY created_at DESC').fetchall()
     conn.close()
@@ -95,25 +104,11 @@ def save_results_to_db(job_id, results_list):
     """Salva uma lista de resultados no banco de dados de forma eficiente."""
     conn = get_db_connection()
     cursor = conn.cursor()
-    
-    # Prepara os dados para inserção em massa
-    rows_to_insert = []
-    for result_row in results_list:
-        rows_to_insert.append((
-            job_id,
-            result_row.get('PROPOSTA'),
-            result_row.get('CEP'),
-            result_row.get('ENDEREÇO'),
-            result_row.get('BAIRRO'),
-            result_row.get('CIDADE'),
-            result_row.get('ESTADO'),
-            result_row.get('STATUS')
-        ))
-
-    cursor.executemany(
-        'INSERT INTO results (job_id, proposta, cep_original, endereco, bairro, cidade, estado, status_api) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        rows_to_insert
-    )
+    rows_to_insert = [
+        (job_id, r.get('PROPOSTA'), r.get('CEP'), r.get('ENDEREÇO'), r.get('BAIRRO'), r.get('CIDADE'), r.get('ESTADO'), r.get('STATUS'))
+        for r in results_list
+    ]
+    cursor.executemany('INSERT INTO results (job_id, proposta, cep_original, endereco, bairro, cidade, estado, status_api) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', rows_to_insert)
     conn.commit()
     conn.close()
 
